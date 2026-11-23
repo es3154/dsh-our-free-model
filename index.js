@@ -29,7 +29,7 @@ import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { externalUrl, openExternal } from './src/open-external.js'
 import { ROUTE_LABELS, ROUTE_MAIN, ROUTE_REGION } from './src/adapter.js'
-import { DATA_DIR_NAME, resolveDshHome, publicModelVisibility, validateModelVisibility, isModelHidden } from './src/store.js'
+import { DATA_DIR_NAME, resolveDshHome, publicModelVisibility, validateModelVisibility, validateProviderGroups, normalizeCustomProviders, isModelHidden } from './src/store.js'
 import { isKiloEntry } from './src/catalog.js'
 import { generateKey, rankLanAddresses, startForwardServer, startLanRelay } from './src/forward.js'
 import { chanGatewayCredential, chanGatewayEnabled, chanGatewayPort, startChanRelay } from './src/chan-relay.js'
@@ -212,6 +212,23 @@ export function apply(ctx, config) {
    */
   const packProviders = new Set()
 
+  /**
+   * 取渠道包 provide 出来的一个服务函数，**每次调用都现查**。
+   *
+   * 为什么不做成「拿一次存起来」：渠道包在 `ctx.inject([...])` 的独立 fiber
+   * 上**异步**挂载（见下方动态 import），第一次 `refreshCatalog` 很可能早于
+   * 它 ready。缓存一个 `undefined` 会让合并组在整个进程生命周期里都不出现。
+   *
+   * 为什么找不到时返回一个**空实现**而不是抛错：调用方是目录重建，任何
+   * 一项数据面缺席都只该让合并组消失，不该让整轮刷新失败（免费车道与链路
+   * 仍要可用）。空实现的具体形状由调用方约定。
+   */
+  const packService = (serviceName, fallback) => (...args) => {
+    const service = typeof ctx.get === 'function' ? ctx.get(serviceName) : undefined
+    const target = typeof service === 'function' ? service : fallback
+    return target(...args)
+  }
+
 /**
  * 上次为路由编辑器重读渠道名册的时刻（毫秒）。
  *
@@ -228,6 +245,22 @@ let channelRosterReadAt = 0
     onTopology: () => emitTopology(),
     llm: ctx.llm,
     packProviders,
+    /**
+     * 「按模型合并」的两个数据面，由渠道包 provide（见
+     * `vendor/channel-pack/src/index.ts`）。都用 `ctx.get` 惰性取：渠道包挂载在
+     * 独立的 fiber 上，此刻可能还没 ready —— 取到 `undefined` 时合并组不出现，
+     * 之后渠道包 ready 会触发一次目录重建（`onPackReady`），届时再取。
+     */
+    channelPackRoster: packService('channelPackRoster', async () => ({ providers: [] })),
+    /**
+     * 渠道是否被用户**整条关闭**（渠道管理页每一行的开关）。
+     *
+     * 合并层读的是未抑制名册（不然后者什么都看不到），所以关闭状态得单独问。
+     * 判据与渠道管理页的 `closed` 一致：那家渠道有目录、且一个不剩全停用。
+     * 渠道包没 provide（旧版本 / 未挂载）时返回 `undefined` = 未知 = 保留。
+     */
+    channelPackProviderClosed: packService('channelPackProviderClosed', async () => undefined),
+    channelPackLaneHealth: packService('channelPackLaneHealth', () => undefined),
     onChannelError: (provider, error) => {
       if (provider === 'listProviders') {
         logger.warn?.(`our-free-model: cannot enumerate providers for the routing catalog (${String(error?.message ?? error)})`)
@@ -265,6 +298,37 @@ let channelRosterReadAt = 0
   ctx.on?.('loader/volatile-update', () => {
     registration.replace(routes())
   })
+
+  /**
+   * 渠道包动了目录时，立刻重建合并组（用户 2026-11-18 报障的收尾）。
+   *
+   * 两条专属事件，各对应一类「名册形状变了」：
+   * - `channel-pack/dead-model-marked`：判死一个新模型；
+   * - `channel-pack/catalog-changed`：渠道整条开关 / 单模型开关（渠道管理页
+   *   的关闭落盘的是「全模型黑名单 + 全账号停用」，合并层读**未抑制**名册，
+   *   不重建就继续把关掉的渠道摆在候选位上）。
+   *
+   * 为什么不用 `llm/adapters-updated`：本插件自己也会 emit 后者，订阅它会形成
+   * 「监听 → 重建 → emit → 监听」的无限递归（2026-11-04 真实事故：主线程
+   * 100%、HTTP 无响应、桌面端起不来）。这两条只有渠道包 emit，我们只听 ——
+   * 无回路。
+   *
+   * 不订阅的后果：合并组读的是**上一轮**名册快照，选择器里那些必然失败的
+   * 合并行要挂到下一轮目录轮询（默认 15 分钟）才消失。
+   */
+  let deadModelSyncTimer
+  const scheduleMergedResync = reason => {
+    if (deadModelSyncTimer !== undefined) return
+    deadModelSyncTimer = setTimeout(() => {
+      deadModelSyncTimer = undefined
+      void modelRuntime.syncAggregateCatalog?.()?.catch?.(error => {
+        logger.warn?.(`our-free-model: merged catalog resync after ${reason} failed (${String(error?.message ?? error)})`)
+      })
+    }, 1_000)
+    deadModelSyncTimer.unref?.()
+  }
+  ctx.on?.('channel-pack/dead-model-marked', () => scheduleMergedResync('dead model'))
+  ctx.on?.('channel-pack/catalog-changed', () => scheduleMergedResync('channel catalog change'))
 
 
 
@@ -817,6 +881,12 @@ let channelRosterReadAt = 0
       if (stopped) return
       const mounted = pack.apply(scoped, {
         disableOpencode: true,
+        /**
+         * 「按模型合并」（用户 2026-11-18）：让各渠道的 `listModels()` 对外
+         * 静默，使选择器里那 20 个渠道分组消失，只留本插件的合并组。
+         * 关掉该项即退回「按渠道分组」的旧行为（设置页开关）。
+         */
+        mergeByModel: settings.get().merge?.enabled !== false,
         outlet: { active: egressActive, fetch: egressFetch, fetchSigned: (input, init, send) => egressFetch(input, init, send) },
       })
       // 包回来的 provider 名单是「哪些 provider 属于本插件的渠道」的唯一权威：
@@ -830,6 +900,15 @@ let channelRosterReadAt = 0
       if (providers.length > 0) {
         void modelRuntime.refreshChannelCatalog().catch(error => {
           logger.warn?.(`our-free-model: channel catalog refresh failed (${String(error?.message ?? error)})`)
+        })
+        /**
+         * 合并组必须在这里重建一次：它读的是渠道包 provide 的
+         * `channelPackRoster`，而此刻包才刚 provide 出来。不补这一次，合并组
+         * 要等到下一轮目录轮询（默认 15 分钟）或用户手动刷新才会出现 ——
+         * 用户装好插件看到的仍是一堆渠道分组，正是本次要消除的观感。
+         */
+        void modelRuntime.syncAggregateCatalog().catch(error => {
+          logger.warn?.(`our-free-model: merged catalog refresh failed (${String(error?.message ?? error)})`)
         })
       }
     }).catch(error => {
@@ -888,6 +967,10 @@ let channelRosterReadAt = 0
     settings, stats, availability, catalog: () => modelRuntime.catalog, state, dataDir,
     hotReload: reloadFromDisk,
     onSettingsChanged: () => syncWatcher(),
+    // 自选分组改的是 membership（哪条路由挂哪些模型），而路由集合就是
+    // `Object.keys(membership)` —— 必须重算目录再 replace，否则新分组要等
+    // 下一次 15 分钟的目录轮询才出现。
+    syncAggregateCatalog,
     refreshCatalog, refreshAvailability, syncForward, syncRelay, syncEgress,
     onVisibilityChanged: emitTopology,
     // ── fallback chains ─────────────────────────────────────────────────────
@@ -1006,7 +1089,7 @@ let channelRosterReadAt = 0
         // closed, and dropping the link would quietly rewrite the user's chain.
         settings.update({ combos: rows })
         settings.flush()
-        const catalog = syncAggregateCatalog()
+        const catalog = await syncAggregateCatalog()
         return { combos: rows, usable: catalog.filter(isComboEntry).map(publicCombo) }
       },
     },
@@ -1546,8 +1629,9 @@ export function createApiRoutes(deps) {
       if (method === 'POST' && routePath === '/settings') {
         const patch = await readJson(req)
         const visibility = validateModelVisibility(patch)
+        const groups = validateProviderGroups(patch)
         const current = deps.settings.get()
-        const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'autoReloadWatch']), ...visibility }, current)
+        const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'autoReloadWatch']), ...visibility, ...groups }, current)
         if (patch.forward !== undefined) {
           const forward = { ...(current.forward ?? {}), ...pick(patch.forward, ['enabled', 'host', 'port']) }
           // The listener spends this machine's lane, and a routable bind address
@@ -1602,6 +1686,13 @@ export function createApiRoutes(deps) {
           return send(500, { error: 'could not persist settings' })
         }
         if (Object.keys(visibility).length > 0) deps.onVisibilityChanged?.()
+        // 分组补丁比可见性更进一步：它改变的是**路由集合**本身（每条分组是
+        // 一个 provider），所以要重算目录 → emitTopology → `registration.replace`。
+        // 失败不吞：页面要看到 why，而不是以为存上了。
+        if (Object.keys(groups).length > 0) {
+          if (typeof deps.syncAggregateCatalog === 'function') await deps.syncAggregateCatalog()
+          else deps.onVisibilityChanged?.()
+        }
         await deps.syncForward()
         await deps.syncRelay()
         await deps.syncEgress()
@@ -1866,6 +1957,8 @@ function publicCombo(entry) {
 function publicSettings(settings, forwardInfo, egressInfo) {
   return {
     ...publicModelVisibility(settings),
+    // 自选分组（「新的 provider」）：页面要能显示已有分组与它们的成员。
+    customProviders: normalizeCustomProviders(settings.customProviders),
     enabled: settings.enabled !== false,
     exposeRegionModels: settings.exposeRegionModels !== false,
     probeIntervalMinutes: settings.probeIntervalMinutes ?? 15,
@@ -1948,6 +2041,11 @@ function buildSummary(deps) {
       // those models, because "the probe refused it" is the user's only evidence.
       route: (state.membership[ROUTE_MAIN] ?? []).includes(entry.id) ? ROUTE_MAIN
         : (state.membership[ROUTE_REGION] ?? []).includes(entry.id) ? ROUTE_REGION : null,
+      // 每一条路由里都挂了哪些模型 —— 自选分组的页面据此显示「这个模型现在
+      // 在哪个分组里」，`route` 只能回答前两条内置路由，回答不了用户自己的。
+      routes: Object.entries(state.membership)
+        .filter(([, ids]) => Array.isArray(ids) && ids.includes(entry.id))
+        .map(([provider]) => provider),
     })),
     settings: publicSettings(deps.settings.get(), forwardInfo, deps.egressInfo()),
     egress: forwardInfo.egress ?? snapshot.egress ?? null,

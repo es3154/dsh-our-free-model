@@ -4,16 +4,19 @@ import type { BuddyCredential } from './buddy.js'
 import type { BuddyProduct } from './product.js'
 import {
   ACCOUNT_STRATEGY_GLOBAL_KEY,
+  DEFAULT_ANTI_BAN,
   createChannelPackStore,
   DEFAULT_ACCOUNT_STICKY_LIMIT,
   mergeLegacyLoomyLock,
   sanitizeAccountSticky,
   sanitizeAccountStrategy,
   sanitizeAccounts,
+  sanitizeAntiBan,
   sanitizeDisabledModels,
   sanitizePermanentLocks,
   sanitizeProviderOrder,
   type AccountStrategy,
+  type AntiBanConfig,
 } from './channel-pack-store.js'
 import type { ChannelPackStore, ChannelPackState, ModelDisableMap, PermanentLockMap } from './channel-pack-store.js'
 import { createPermanentLockStore } from './permanent-lock-store.js'
@@ -68,6 +71,18 @@ export const RATE_LIMIT_KEEP_MS = 7 * 24 * 60 * 60 * 1000
  */
 export const RISK_FIRST_COOLDOWN_MS = 30 * 60 * 1000
 export const RISK_REPEAT_COOLDOWN_MS = 24 * 60 * 60 * 1000
+
+/**
+ * **B：每日用量的自然日键（防封节奏，2026-11-19）**。
+ *
+ * 按 UTC+8 取日（中国用户的「一天」）；纯函数，便于单测跨日边界。
+ */
+export const AntiBanClock = {
+  dayKey(now: number): string {
+    const d = new Date(now + 8 * 60 * 60 * 1000)
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`
+  },
+}
 
 
 /**
@@ -218,6 +233,11 @@ export class AccountPool {
    */
   private accountStickyCache: Record<string, number> = {}
   /**
+   * 「防封节奏」配置（2026-11-19）。全局一项；缺键逐字段回落
+   * {@link DEFAULT_ANTI_BAN}。
+   */
+  private antiBanCache: Record<string, AntiBanConfig> = {}
+  /**
    * 轮询游标（按 provider，**内存态**）。
    *
    * 为什么不像路由链路那样只存内存：这里也一样 —— 重启丢失游标的代价只是
@@ -288,6 +308,8 @@ export class AccountPool {
       this.providerOrderCache = state.providerOrder ?? []
       this.accountStrategyCache = sanitizeAccountStrategy(state.accountStrategy)
       this.accountStickyCache = sanitizeAccountSticky(state.accountStickyLimit)
+      // 防封节奏：老文档没有该键 → 全部字段走默认值。
+      this.antiBanCache = sanitizeAntiBan(state.antiBan)
     }
     this.loadLocks(state)
   }
@@ -373,6 +395,8 @@ export class AccountPool {
         providerOrder: this.providerOrderCache,
         accountStrategy: this.accountStrategyCache,
         accountStickyLimit: this.accountStickyCache,
+        // 防封节奏与策略同源同快照；分两次快照会让同一份文档里的字段互相矛盾。
+        antiBan: this.antiBanCache,
       })
       // 自己写盘后立即同步 mtime：否则下一次 ensureLoaded 会把「自己刚写的」
       // 误判成外部改动，导致立刻整份重读（白解析一遍 JSON）。
@@ -528,6 +552,74 @@ export class AccountPool {
     await this.queueStoreSave()
     return this.accountStrategy()
   }
+
+  /**
+   * 「防封节奏」配置的**有效值**（2026-11-19）。
+   *
+   * 每个字段独立回落默认：用户只设过 `minIntervalMs` 时，其余字段仍走
+   * {@link DEFAULT_ANTI_BAN} —— 而不是「设过一个键就把其余键当成 0/关」。
+   * 这与 `sanitizeAntiBan` 的逐字段口径一致。
+   */
+  private antiBanValue(): Required<AntiBanConfig> {
+    this.ensureLoaded()
+    const cfg = this.antiBanCache[ACCOUNT_STRATEGY_GLOBAL_KEY] ?? {}
+    return {
+      minIntervalMs: cfg.minIntervalMs ?? DEFAULT_ANTI_BAN.minIntervalMs,
+      jitter: cfg.jitter ?? DEFAULT_ANTI_BAN.jitter,
+      dailyLimit: cfg.dailyLimit ?? DEFAULT_ANTI_BAN.dailyLimit,
+      randomRotation: cfg.randomRotation ?? DEFAULT_ANTI_BAN.randomRotation,
+      riskBackoffMs: cfg.riskBackoffMs ?? DEFAULT_ANTI_BAN.riskBackoffMs,
+    }
+  }
+
+  /** 读取防封节奏（供渠道接入页「防封节奏」区渲染）。 */
+  antiBan(): Required<AntiBanConfig> {
+    return this.antiBanValue()
+  }
+
+  /**
+   * 设置防封节奏（部分更新：只带上的字段被覆盖，未带字段保留原值）。
+   *
+   * ⚠️ 与 setAccountStrategy 不同，这里**必须传完整对象**才能表达「恢复默认」：
+   * UI 侧把整份 Required<AntiBanConfig> 发上来，本方法原样夹紧落盘。
+   */
+  async setAntiBan(patch: Partial<AntiBanConfig>): Promise<Required<AntiBanConfig>> {
+    this.ensureLoaded()
+    const current = this.antiBanValue()
+    const merged: Required<AntiBanConfig> = {
+      minIntervalMs: patch.minIntervalMs ?? current.minIntervalMs,
+      jitter: patch.jitter ?? current.jitter,
+      dailyLimit: patch.dailyLimit ?? current.dailyLimit,
+      randomRotation: patch.randomRotation ?? current.randomRotation,
+      riskBackoffMs: patch.riskBackoffMs ?? current.riskBackoffMs,
+    }
+    // 夹紧口径与 sanitizeAntiBan 一致；这里对 merged 再夹一次，让 RPC 直传的
+    // 脏值（负数/NaN 之外的越界值）也回到合法区间。
+    merged.minIntervalMs = Math.min(10 * 60 * 1000, Math.max(0, Math.trunc(merged.minIntervalMs)))
+    merged.jitter = Math.min(0.9, Math.max(0, merged.jitter))
+    merged.dailyLimit = Math.min(10000, Math.max(0, Math.trunc(merged.dailyLimit)))
+    merged.riskBackoffMs = Math.min(24 * 60 * 60 * 1000, Math.max(0, Math.trunc(merged.riskBackoffMs)))
+    this.antiBanCache = { ...this.antiBanCache, [ACCOUNT_STRATEGY_GLOBAL_KEY]: merged }
+    await this.queueStoreSave()
+    return this.antiBanValue()
+  }
+
+  /**
+   * **A：账号级请求间隔（pacing）**（2026-11-19）。
+   *
+   * 内存态：账号 id → 最近一次被选中交给调用方的时刻。重启归零无害 ——
+   * 冷启动后第一次请求天然「间隔足够久」，落盘反而让每次选号多一次写盘。
+   *
+   * ⚠️ 只在 `getAvailableAccount` **成功返回**时记时刻：候选被跳过（凭据坏）
+   * 或返回 null 都不该记账。
+   */
+  private readonly lastUseByAccount = new Map<string, number>()
+  /**
+   * **D：渠道级风控退避**（2026-11-19）。provider → 退避截止时刻（毫秒）。
+   * 内存态，理由同上：重启后风控计数重新从「首次」起步，与
+   * `recordAccountRisk` 的阶梯语义自洽。
+   */
+  private readonly providerBackoffUntil = new Map<string, number>()
 
 
   /**
@@ -1261,11 +1353,27 @@ export class AccountPool {
     const carried = cursor.accountId !== undefined && cursor.accountId !== headId ? 0 : cursor.used
     if ((options.advance ?? true) !== false) {
       const used = carried + 1
+      if (used >= sticky) {
+        /*
+         * C：随机换号（2026-11-19 防封节奏）。sticky 名额用完时，下一个账号
+         * 不再固定 +1，而是在**其余**候选里随机挑 —— 名额语义完全不变，
+         * 只消除「1→2→3→1」这种可被上游关联的固定顺序。
+         * `randomRotation = false` 时保持原 +1 行为（用户可关）。
+         */
+        const others = candidates.filter((_, i) => i !== index)
+        const nextIndex = this.antiBanValue().randomRotation && others.length > 0
+          ? candidates.indexOf(others[Math.floor(Math.random() * others.length)]!)
+          : (index + 1) % candidates.length
+        this.accountRotation.set(
+          provider,
+          { index: nextIndex, used: 0, accountId: AccountPool.accountIdOf(candidates[nextIndex]) },
+        )
+        // 名额用完本次就换人：把新游标指的账号挪到队首。
+        return [...candidates.slice(nextIndex), ...candidates.slice(0, nextIndex)]
+      }
       this.accountRotation.set(
         provider,
-        used >= sticky
-          ? { index: (index + 1) % candidates.length, used: 0, accountId: AccountPool.accountIdOf(candidates[(index + 1) % candidates.length]) }
-          : { index, used, accountId: headId },
+        { index, used, accountId: headId },
       )
     }
     return [...candidates.slice(index), ...candidates.slice(0, index)]
@@ -1308,6 +1416,24 @@ export class AccountPool {
         const resetAt = a.modelRateLimits[modelId]
         return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt
       })
+    /**
+     * ★ 风控冷却期账号从选号中剔除（用户 2026-11-18「方案 A」）。
+     *
+     * `riskBlockedUntilMs` 在冷却期内 ⇒ 不进本轮候选，**轮询/顺序两种模式一致**
+     * —— 与限流不同（轮询铁律说「轮到谁交谁」，那是因为限流撞一次只是白等
+     * 几秒），风控 3012 撞一次有**惩罚计数**：冷却中再命中会把 30 分钟升级成
+     * 24 小时。明知会升级还送上去，是把「轮询纯度」置于账号寿命之上。
+     *
+     * 回退：全部账号都在风控冷却 ⇒ 仍按原顺序交付（候选为空会让请求直接
+     * 「没有可用账号」）。这与限流 tail 的既有语义一致：宁可让上游如实报错，
+     * 也不让池层把一个 provider 整条判死。
+     */
+    const now = Date.now()
+    const riskFree = candidates.filter(a => {
+      const until = a.riskBlockedUntilMs
+      return typeof until !== 'number' || !Number.isFinite(until) || until <= now
+    })
+    if (riskFree.length > 0) candidates.splice(0, candidates.length, ...riskFree)
     if (candidates.length === 0) return null
     /**
      * 账号轮询（2026-11-04 用户要求）。
@@ -1346,6 +1472,58 @@ export class AccountPool {
       advance: excludeAccountIds === undefined,
     })
     candidates.splice(0, candidates.length, ...rotated)
+    /*
+     * 防封节奏（2026-11-19）：A pacing + B 日限 + D 渠道退避，**只重排不筛除**。
+     *
+     * 设计约束：轮询铁律说「轮到谁交谁」，防封层绝不把候选变空（那会把
+     * 「没有可用账号」的锅甩给防封层）。因此三项都做成**排序偏好**：
+     * - B（日限）：顶到每日上限的账号排到候选**尾部** —— 别的号都用尽时
+     *   仍可超限兜底（宁可超一次配额，也不让请求失败）。
+     * - A（pacing）：上次使用距今不足 minInterval 的账号排到尾部 —— 轮询
+     *   模式下自然顺延到间隔足够的号；全部号都间隔不足时按原顺序交付
+     *   （降级为「不 pacing」，绝不空手而归）。
+     * - D（退避）：渠道退避期内 minInterval ×2 —— 全渠道降速，不拒答。
+     * `sequential` 模式完全不走这段（历史行为不变）。
+     */
+    const antiBan = this.antiBanValue()
+    if (roundRobin && candidates.length > 1) {
+      const nowMs = Date.now()
+      const backoffUntil = this.providerBackoffUntil.get(provider) ?? 0
+      // D：渠道退避期内间隔翻倍（至少 1s 才有「降速」意义）。
+      const minInterval = backoffUntil > nowMs
+        ? Math.max(1000, antiBan.minIntervalMs * 2)
+        : antiBan.minIntervalMs
+      // 每个账号的「本次可用时刻」：上次使用 + 间隔（±抖动，抖动在记时刻时
+      // 已决定间隔长度，这里用同一把尺复算 —— 保存抖动值会让 Map 膨胀，
+      // 用期望值判定足够：抖动的目的是让上游看到的节奏不均匀，不是自欺）。
+      const jitter = antiBan.jitter
+      const readyAt = (lastUse: number | undefined, jitterRoll: number): number =>
+        lastUse === undefined ? 0 : lastUse + minInterval * (1 + jitter * jitterRoll)
+      // B：日限键（UTC+8 自然日）。
+      const todayKey = AntiBanClock.dayKey(nowMs)
+      const scoreOf = (entry: ProviderAccountEntry): number => {
+        let score = 0
+        const usage = entry.dailyUsage
+        if (antiBan.dailyLimit > 0 && usage !== undefined && usage.date === todayKey
+          && usage.count >= antiBan.dailyLimit) score |= 2 // 日限顶格 → 排尾
+        const last = this.lastUseByAccount.get(entry.id)
+        if (minInterval > 0 && last !== undefined && nowMs < readyAt(last, Math.random())) {
+          score |= 1 // pacing 未到 → 排尾
+        }
+        return score
+      }
+      if (candidates.some(entry => scoreOf(entry) > 0)) {
+        // 稳定分区：score 0 在前、1/2 在后；同分区保持手动顺序（轮转后的队首次序）。
+        const head = candidates.filter(entry => scoreOf(entry) === 0)
+        const tail = candidates.filter(entry => scoreOf(entry) > 0)
+        candidates.splice(0, candidates.length, ...head, ...tail)
+        if (head.length === 0) {
+          this.ctx.logger?.info?.(
+            `[channel-pack] ${provider} 全部候选都在防封等待中（pacing/日限），按原顺序降级交付`,
+          )
+        }
+      }
+    }
     // 候选顺序即**用户在 Channel Pack 拖拽设定的手动顺序**（`reorderAccounts` 写入）。
     //
     // 为什么不再按「限流重置时间最早到期」重排（早期实现如此）：
@@ -1381,6 +1559,10 @@ export class AccountPool {
             `[channel-pack] ${failures.length} 个 ${provider} 账号不可用，已跳过：${failures.join('; ')}`,
           )
         }
+        // A：成功交付才记 pacing 时刻（跳过/失败不记 —— 见 lastUseByAccount 注释）。
+        if (this.accountStrategyValue() === 'round-robin') {
+          this.lastUseByAccount.set(entry.id, Date.now())
+        }
         return { entry, credential }
       } catch (error) {
         failures.push(`${entry.id}: 凭据 JSON 损坏 (${String(error)})`)
@@ -1393,6 +1575,37 @@ export class AccountPool {
       )
     }
     return null
+  }
+
+  /**
+   * **B：记账一次账号用量**（防封节奏，2026-11-19）。
+   *
+   * 由 `llm-register-compat` 的**流式成功路径**调用（与 clearAnomalyOnSuccess
+   * 同点接线）：只有真的产出内容的请求才消耗当日配额；失败/重试不计。
+   *
+   * 写盘频率：每成功请求一次全量 state 写。state.json 本就很小（几十个账号），
+   * 且 pacing 已把成功 QPS 压到秒级 —— 可接受。`dailyLimit=0`（关闭日限）时
+   * 直接跳过，不产生任何写盘。
+   */
+  async recordAccountUse(accountId: string, now: number = Date.now()): Promise<void> {
+    const { dailyLimit } = this.antiBanValue()
+    if (dailyLimit <= 0) return
+    if (accountId.length === 0 || !Number.isFinite(now)) return
+    const accounts = this.readAccounts()
+    const idx = accounts.findIndex(a => a.id === accountId)
+    if (idx === -1) return
+    const entry = accounts[idx]!
+    const today = AntiBanClock.dayKey(now)
+    const usage = entry.dailyUsage
+    const count = usage !== undefined && usage.date === today ? usage.count + 1 : 1
+    const next = [...accounts]
+    next[idx] = { ...entry, dailyUsage: { date: today, count } }
+    await this.writeAccounts(next)
+    if (count === dailyLimit) {
+      this.ctx.logger?.info?.(
+        `[channel-pack] 账号 ${accountId} 已达每日用量上限（${dailyLimit} 次），今日排尾`,
+      )
+    }
   }
 
   /**
@@ -1511,8 +1724,9 @@ export class AccountPool {
    * 否则记首次的 {@link RISK_FIRST_COOLDOWN_MS}。只接受比现值**更长**的解禁时刻，
    * 与限流标记同约定 —— 冷却未完又命中只会更糟，绝不能用新值把已知的 24h 写回 30min。
    *
-   * ⚠ **不参与选号**（见 types.ts 的 `riskBlockedUntilMs` 注释）：它只服务于
-   * 「异常汇总」的红色风控徽标；真正的「别连点」由请求路径的 3012 短路守卫负责。
+   * ⚠ **参与选号**（用户 2026-11-18「方案 A」）：`getAvailableAccount` 会把
+   * 冷却期内的账号剔出候选（全部账号都在冷却时回退交付）；同时它仍服务于
+   * 「异常汇总」的红色风控徽标。
    */
   async recordAccountRisk(accountId: string, now: number = Date.now()): Promise<void> {
     const accounts = this.readAccounts()
@@ -1536,6 +1750,25 @@ export class AccountPool {
       `[channel-pack] 已记录账号风控: ${accountId} `
       + `${escalating ? '重复命中，冷却升级' : '首次命中'}至 ${new Date(resetAtMs).toISOString()}`,
     )
+    /*
+     * D：渠道级风控退避（防封节奏，2026-11-19）。
+     *
+     * 账号命中 3012 ⇒ 该 provider 整个进入「降速模式」：退避期内
+     * `getAvailableAccount` 的 pacing 间隔 ×2。**降速不拒答** —— 退避只影响
+     * 间隔，不把渠道掐死。
+     *
+     * 时长与账号冷却同款阶梯：首次 riskBackoffMs（默认 5min）、冷却中重复
+     * 命中 ×6（默认 30min，恰好与 RISK_REPEAT_COOLDOWN_MS=24h 的比例对齐
+     * 用户「重复更重」的预期）。
+     */
+    const backoffMs = this.antiBanValue().riskBackoffMs
+    if (backoffMs > 0) {
+      const provider = next[idx]!.provider
+      const until = now + (escalating ? backoffMs * 6 : backoffMs)
+      const prev = this.providerBackoffUntil.get(provider) ?? 0
+      // 只延长不缩短：同渠道两个账号先后命中，取更晚的截止时刻。
+      if (until > prev) this.providerBackoffUntil.set(provider, until)
+    }
   }
 
   /**
@@ -1836,5 +2069,81 @@ export async function providerHasLoggedInAccount(
     return await accountPool.hasLoggedInAccount(provider)
   } catch {
     return true
+  }
+}
+
+/** 一个渠道对某个模型当前的**可用性画像**（合并层排序用）。 */
+export interface ModelLaneHealth {
+  /** 该渠道还有几个账号没被这个模型卡住。 */
+  readonly freeAccounts: number
+  /** 该渠道登记了几条这个模型的限流标记（0 = 一个都没卡）。 */
+  readonly limitedAccounts: number
+  /** 全部账号都被卡住时，最早的解禁时刻（毫秒）；否则 `undefined`。 */
+  readonly resetAtMs: number | undefined
+  /** 该渠道是否有已登录账号；没有就根本不该被排进候选。 */
+  readonly hasAccount: boolean
+}
+
+/**
+ * 一个渠道对一个模型的可用性画像（用户 2026-11-18 的「按额度自动分配」）。
+ *
+ * ## 只用本地硬信号
+ *
+ * 用户明确选了「只用本地硬信号」这条路：**不发任何额外网络请求**，只读账号池
+ * 里已经存在的 `modelRateLimits`。那是各适配器在**上游真的回了限流/欠费**时
+ * 写下的解禁时刻（见 `updateModelRateLimit` 的调用点），是已经付过代价拿到的
+ * 事实，不是猜的。
+ *
+ * 为什么不去主动拉余额：20 个渠道里只有少数（codearts / qoder / cline /
+ * zcode …）有余额端点，其余要么没有、要么要额外鉴权；为「排序」这点收益
+ * 去打 20 个上游，既费额度又会让冷启动变慢。余额大小这条软信号留待以后
+ * （`ModelLaneHealth` 加字段即可，排序逻辑不用改）。
+ *
+ * ## 与选号的关系
+ *
+ * 这里**不改选号**：真正的账号挑选仍由各渠道自己的 `getAvailableAccount`
+ * 负责（`sequential` 模式跳限流号、`round-robin` 模式照轮）。本函数只回答
+ * 「这一家整体还撑得住吗」，供合并层把撑得住的那家排前面。
+ */
+export async function modelLaneHealth(
+  accountPool: AccountPool | undefined,
+  provider: string,
+  modelId: string,
+  now: number = Date.now(),
+): Promise<ModelLaneHealth> {
+  if (accountPool === undefined) {
+    // 没有账号池（纯免费车道 / 测试替身）：不给任何判断，按「健康」处理，
+    // 否则合并层会把所有渠道都判成不可用、排出一个随机顺序。
+    return { freeAccounts: 0, limitedAccounts: 0, resetAtMs: undefined, hasAccount: true }
+  }
+  let accounts: readonly ProviderAccountEntry[] = []
+  try {
+    const all = await accountPool.listAllAccounts()
+    accounts = all.filter(entry => entry.provider === provider && entry.enabled)
+  } catch {
+    return { freeAccounts: 0, limitedAccounts: 0, resetAtMs: undefined, hasAccount: true }
+  }
+  if (accounts.length === 0) {
+    const loggedIn = await providerHasLoggedInAccount(accountPool, provider)
+    return { freeAccounts: 0, limitedAccounts: 0, resetAtMs: undefined, hasAccount: loggedIn }
+  }
+  let freeAccounts = 0
+  let limitedAccounts = 0
+  let earliest: number | undefined
+  for (const account of accounts) {
+    const resetAt = account.modelRateLimits?.[modelId]
+    // 与选号侧同一判据：缺标记 / 0 / 已过期都算「不受限」。
+    if (resetAt === undefined || resetAt === 0 || now >= resetAt) {
+      freeAccounts += 1
+      continue
+    }
+    limitedAccounts += 1
+    earliest = earliest === undefined ? resetAt : Math.min(earliest, resetAt)
+  }
+  return {
+    freeAccounts,
+    limitedAccounts,
+    resetAtMs: freeAccounts === 0 ? earliest : undefined,
+    hasAccount: true,
   }
 }
