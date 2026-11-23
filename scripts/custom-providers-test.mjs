@@ -74,17 +74,15 @@ rejects({ customProviders: [group('ofm-xx1', '', ['m'])] }, 'empty name')
 rejects({ customProviders: [group('ofm-xx1', 'y'.repeat(41), ['m'])] }, 'name too long')
 rejects({ customProviders: [group('ofm-xx1', '名', 'm')] }, 'models must be an array')
 rejects({ customProviders: [group('ofm-xx1', '名', [''])] }, 'model ids must be nonempty')
-rejects({ hideBaseGroup: 'yes' }, 'hideBaseGroup must be a boolean')
+// hideBaseGroup 配置项已删除：不再是合法字段
 
 // 合法的补丁：只保留认识的键，值是被规整过的
 const patch = validateProviderGroups({
   customProviders: [group('ofm-daily', '日常', ['merged:glm-5.3'])],
-  hideBaseGroup: true,
   somethingElse: 'ignored',
 })
-assert.deepEqual(Object.keys(patch).sort(), ['customProviders', 'hideBaseGroup'])
+assert.deepEqual(Object.keys(patch).sort(), ['customProviders'])
 assert.equal(patch.customProviders[0].id, 'ofm-daily')
-assert.equal(patch.hideBaseGroup, true)
 assert.deepEqual(validateProviderGroups({}), {}, '空补丁 = 不动任何东西')
 
 // ── 3. 广播：分组真的进了 membership，且仍受黑名单约束 ────────────────────────
@@ -185,16 +183,14 @@ const listed = await makeAdapter({ customProviders: [group('ofm-daily', '日常'
 assert.deepEqual(listed.map(row => row.id), ['merged:glm-5.3'])
 assert.equal(listed[0].provider, 'ofm-daily', 'provider 字段要回填成这条路由')
 
-// 收起默认分组：只在「有分组 + 开了开关 + 是默认路由」时发生
-const hiddenBase = { customProviders: [group('ofm-daily', '日常', ['merged:glm-5.3'])], hideBaseGroup: true }
+// 收起默认分组：已硬编码——默认路由不再播报任何模型（2026-11-23 决策）
+const hiddenBase = { customProviders: [group('ofm-daily', '日常', ['merged:glm-5.3'])] }
 assert.deepEqual(await makeAdapter(hiddenBase).listModels('our-free-model'), [])
 assert.deepEqual(await makeAdapter(hiddenBase).listModels('our-free-model-region'), [])
 assert.deepEqual((await makeAdapter(hiddenBase).listModels('ofm-daily')).map(row => [row.provider, row.id, row.name]), [['ofm-daily', 'merged:glm-5.3', 'GLM-5.3']])
 
-// 没有分组时绝不收起：否则选择器就空了
-assert.equal((await makeAdapter({ hideBaseGroup: true }).listModels('our-free-model')).length, 1)
-// 开关关着也不收起
-assert.equal((await makeAdapter({ customProviders: hiddenBase.customProviders }).listModels('our-free-model')).length, 1)
+// 硬编码后即使没有任何分组也不播报：新模型需先加入自选分组才会出现在选择器
+assert.deepEqual(await makeAdapter({}).listModels('our-free-model'), [])
 
 // ── 4b. 停用的广告与名字 ──────────────────────────────────────────────────────
 // listModels：关闭的分组返回空 —— 选择器丢空组，整个分组从选择器消失

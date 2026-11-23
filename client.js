@@ -6260,18 +6260,8 @@ window.__ModuleLoader__.load({
         disabled: busy || draft !== null || groups.length >= CUSTOM_LIMIT,
         onClick: startNew,
       }, t('groups.new'))
-      const base = h('div', { className: 'ofm_panel' },
-        h('div', { className: 'ofm_paneltitle' },
-          t('groups.default'),
-          h('span', { className: 'ofm_sec_hint' }, t('groups.defaultHint'))),
-        h('div', { className: 'ofm_row' },
-          h(Switch, {
-            checked: settings.hideBaseGroup === true,
-            disabled: busy || groups.length === 0,
-            label: t('groups.hideBase'),
-            onChange: () => apply({ hideBaseGroup: settings.hideBaseGroup !== true }),
-          }),
-          h('span', { className: 'ofm_note' }, groups.length === 0 ? t('groups.hideBaseLocked') : t('groups.hideBaseHint'))))
+      // 默认分组配置面板已删除（收起硬编码，见 src/adapter.js listModels）
+      const base = null
       const editor = draft === null ? null : h('div', { className: 'ofm_panel ofm_gedit' },
         h('div', { className: 'ofm_ghead' },
           h('span', { className: 'ofm_paneltitle' }, draft.name.trim() === '' ? t('groups.new') : draft.name.trim()),
@@ -6326,7 +6316,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'ofm_pills' },
             h(Pill, { strong: true }, t('groups.gcount').replace('{n}', String(groups.length)).replace('{max}', String(CUSTOM_LIMIT))),
             h(Pill, null, t('groups.poolCount').replace('{n}', String(pool.length))),
-            settings.hideBaseGroup === true ? h(Pill, { tone: 'ok' }, t('groups.hidden')) : null)),
+            h(Pill, { tone: 'ok' }, t('groups.hidden')))),
         h(Section, { title: t('groups.list'), hint: t('groups.limit').replace('{n}', String(CUSTOM_LIMIT)) },
           h('div', { className: 'ofm_ggrid' },
             groups.map(item),

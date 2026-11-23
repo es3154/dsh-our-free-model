@@ -179,12 +179,9 @@ export const SETTINGS_INITIAL = {
    * - `models` 是池子里的模型 id：合并行 `merged:<key>`、链路 `combo:<id>`、
    *   自由车道 id 都可以混选。
    *
-   * `hideBaseGroup`：选了自选分组之后，把默认那两条路由（免费车道 + 地域限制
-   * 车道）从选择器里藏掉，只留下自选的几条 —— 否则「自己挑干净的」这件事
-   * 等于没做。只影响广告：已保存的会话照样能用旧 id 发消息。
+   * `hideBaseGroup` 已删除（2026-11-23 决策）：默认分组收起改为硬编码，见 src/adapter.js。
    */
   customProviders: [],
-  hideBaseGroup: false,
   /** Minutes between background availability re-probes. */
   probeIntervalMinutes: 15,
   /** Serve the OpenAI-compatible forward listener for other local harnesses. */
@@ -357,12 +354,7 @@ export function validateProviderGroups(patch) {
     }
     result.customProviders = normalizeCustomProviders(value)
   }
-  if (Object.hasOwn(patch, 'hideBaseGroup')) {
-    if (typeof patch.hideBaseGroup !== 'boolean') {
-      throw Object.assign(new TypeError('hideBaseGroup must be a boolean'), { statusCode: 400 })
-    }
-    result.hideBaseGroup = patch.hideBaseGroup
-  }
+  // hideBaseGroup 配置项已删除：PATCH 不再接受该字段。
   return result
 }
 

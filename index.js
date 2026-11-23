@@ -1959,7 +1959,6 @@ function publicSettings(settings, forwardInfo, egressInfo) {
     ...publicModelVisibility(settings),
     // 自选分组（「新的 provider」）：页面要能显示已有分组与它们的成员。
     customProviders: normalizeCustomProviders(settings.customProviders),
-    hideBaseGroup: settings.hideBaseGroup === true,
     enabled: settings.enabled !== false,
     exposeRegionModels: settings.exposeRegionModels !== false,
     probeIntervalMinutes: settings.probeIntervalMinutes ?? 15,

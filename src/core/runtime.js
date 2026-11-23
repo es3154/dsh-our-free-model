@@ -854,6 +854,9 @@ export function computeMembership(catalog, availabilitySnapshot, settings) {
     else if (expose) region.push(entry.id)
   }
   const membership = {}
+  // 注意：收起默认分组只掐 src/adapter.js listModels 的广告（硬编码）；路由注册与
+  // 分组管理页模型池（routes 非空才可挑）都读 membership——删这两行会让 merged 行
+  // 从分组管理页消失（lite.3 回归教训，lite.4 修复）。
   if (main.length > 0) membership[ROUTE_MAIN] = main
   if (region.length > 0) membership[ROUTE_REGION] = region
   /**
