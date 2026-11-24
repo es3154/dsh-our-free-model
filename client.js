@@ -6169,8 +6169,9 @@ window.__ModuleLoader__.load({
         }
         const buckets = []
         for (const [key, list] of map) {
-          if (list.length < 2) rest.push(...list)
-          else buckets.push({ key, label: key.toUpperCase(), rows: list })
+          // 2026-11-24: 取消 <2 倒进「其他」——档位名已带产品前缀，单模型族给独立
+          // 标题；只有非拉丁名（key 为 null）才落 OTHER，避免杂物抽屉。
+          buckets.push({ key, label: key.toUpperCase(), rows: list })
         }
         buckets.sort((a, b) => b.rows.length - a.rows.length || a.key.localeCompare(b.key))
         if (rest.length > 0) {

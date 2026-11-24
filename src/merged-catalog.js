@@ -172,22 +172,88 @@ export function stripMultiplierSuffix(name) {
  *
  * 最后兜底用归并键而不是原 id —— 归并键已经是去掉装饰后的稳定形态。
  */
+/**
+ * 渠道内部代号与档位名的产品前缀映射（2026-11-24 用户口径：「模型名字是
+ * 自动/Auto 这种，还有归类的『其他』，有点乱」）。
+ *
+ * 三类脏名，三种处理：
+ * 1. 档位后缀（autoclaw 的「GLM-5.3-Flash · 低」）——先剥掉，多数行就此干净；
+ * 2. 档位名/内部代号（自动/Auto/cmodel/smodel/dfmodel/M3.1-Flash…）——
+ *    前缀成 `<产品名> · <原名>`，出处一眼可辨，分族自然落到 QODER/AUTOCLAW；
+ * 3. 家族名被剥（MiniMax 的 M3/M3.1-Flash）——按 id 里的家族词找回厂商名。
+ *
+ * merged id 一律不变，只动展示名；存量会话按 id 解析，不受影响。
+ */
+const PROVIDER_LABELS = {
+  qoder: 'Qoder',
+  qodercn: 'Qoder CN',
+  buddy: 'CodeBuddy',
+  workbuddy: 'WorkBuddy',
+  trae: 'TRAE',
+  codearts: 'CodeArts',
+  loomy: 'Loomy',
+  raccoon: 'Raccoon',
+  minimax: 'MiniMax',
+  zcode: 'ZCode',
+  cline: 'Cline',
+  antigravity: 'Antigravity',
+  autoclaw: 'AutoClaw',
+  commandcode: 'Command Code',
+  officeace: 'OfficeAce',
+}
+/** 家族词提示：归并键或任一成员 id 含该词 ⇒ 前缀用厂商名而不是上报渠道。 */
+const FAMILY_HINTS = [['minimax', 'MiniMax']]
+/** autoclaw 系的档位后缀：名字尾巴上的「 · 低/中/高」。 */
+const TIER_SUFFIX = /\s*·\s*(?:极低|低|中|高|极高|超高)\s*$/u
+const GENERIC_TIER_NAME = /^(自动|快速|旗舰|默认|标准|均衡|经济|智能|auto(?:-fast)?|efficient|ultimate|fast|smart|default[- ]?model|m\d+(?:\.\d+)?(?:-flash)?)$/i
+const INTERNAL_CODE_ID = /^[a-z]{1,2}model(?:_\S+)?$/i
+
+function stripTierSuffix(name) {
+  return String(typeof name === 'string' ? name : '').trim().replace(TIER_SUFFIX, '')
+}
+
+/** 该合并行是否需要加产品前缀（档位名或内部代号）；家族词优先。 */
+function tierPrefix(models, canonicalKey, winner) {
+  const codeish = INTERNAL_CODE_ID.test(String(canonicalKey || ''))
+  const tier = winner !== '' && GENERIC_TIER_NAME.test(winner)
+  if (!codeish && !tier) return null
+  const hint = FAMILY_HINTS.find(([word]) => String(canonicalKey || '').includes(word)
+    || models.some(model => String(model?.id || '').toLowerCase().includes(word)))
+  if (hint !== undefined) return hint[1]
+  const owner = models.find(model => stripTierSuffix(model?.name) === winner) || models[0]
+  const provider = typeof owner?.provider === 'string' ? owner.provider : ''
+  if (provider === '') return null
+  return PROVIDER_LABELS[provider] ?? provider
+}
+
 function displayNameOf(models, canonicalKey) {
   const candidates = models
-    .map(model => (typeof model.name === 'string' ? model.name.trim() : ''))
+    .map(model => {
+      let name = typeof model?.name === 'string' ? model.name.trim() : ''
+      for (let guard = 0; guard < 4; guard += 1) {
+        const next = stripTierSuffix(stripMultiplierSuffix(name))
+        if (next === name) break
+        name = next
+      }
+      return name
+    })
     .filter(name => name !== '')
-  if (candidates.length === 0) return canonicalKey
-  const score = name => {
-    let value = 0
-    if (/[A-Z]/.test(name)) value += 4
-    if (!/\s/.test(name)) value += 2
-    // 裸 id 特征：全小写且含连字符
-    if (name === name.toLowerCase() && name.includes('-')) value -= 3
-    // 长度接近归并键的最像「该模型的正式名」
-    value -= Math.abs(name.length - canonicalKey.length) / 20
-    return value
-  }
-  return candidates.reduce((best, name) => (score(name) > score(best) ? name : best), candidates[0])
+  const winner = candidates.length === 0
+    ? canonicalKey
+    : candidates.reduce((best, name) => (score(name, canonicalKey) > score(best, canonicalKey) ? name : best), candidates[0])
+  const prefix = tierPrefix(models, canonicalKey, winner)
+  return prefix === null ? winner : prefix + ' · ' + winner
+}
+
+function score(name, canonicalKey) {
+  let value = 0
+  if (/[A-Z]/.test(name)) value += 4
+  if (!/\s/.test(name)) value += 2
+  // 裸 id 特征：全小写且含连字符
+  if (name === name.toLowerCase() && name.includes('-')) value -= 3
+  // 长度接近归并键的最像「该模型的正式名」
+  value -= Math.abs(name.length - (canonicalKey === undefined ? 0 : canonicalKey.length)) / 20
+  return value
 }
 
 /**
